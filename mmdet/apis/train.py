@@ -3,6 +3,7 @@ import re
 from collections import OrderedDict
 
 import torch
+import torch.distributed as dist
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
 from mmcv.runner import DistSamplerSeedHook, Runner, obj_from_dict
 
@@ -28,8 +29,12 @@ def parse_losses(losses):
     loss = sum(_value for _key, _value in log_vars.items() if 'loss' in _key)
 
     log_vars['loss'] = loss
-    for name in log_vars:
-        log_vars[name] = log_vars[name].item()
+    for loss_name, loss_value in log_vars.items():
+        # reduce loss when distributed training
+        if dist.is_initialized():
+            loss_value = loss_value.data.clone()
+            dist.all_reduce(loss_value.div_(dist.get_world_size()))
+        log_vars[loss_name] = loss_value.item()
 
     return loss, log_vars
 
@@ -193,6 +198,11 @@ def _dist_train(model, dataset, cfg, validate=False):
 
 
 def _non_dist_train(model, dataset, cfg, validate=False):
+    if validate:
+        raise NotImplementedError('Built-in validation is not implemented '
+                                  'yet in not-distributed training. Use '
+                                  'distributed training or test.py and '
+                                  '*eval.py scripts instead.')
     # prepare data loaders
     dataset = dataset if isinstance(dataset, (list, tuple)) else [dataset]
     data_loaders = [
