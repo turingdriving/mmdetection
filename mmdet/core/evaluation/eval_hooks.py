@@ -1,170 +1,126 @@
-import os
+# Copyright (c) OpenMMLab. All rights reserved.
+import bisect
 import os.path as osp
 
 import mmcv
-import numpy as np
-import torch
 import torch.distributed as dist
-from mmcv.parallel import collate, scatter
-from mmcv.runner import Hook
-from pycocotools.cocoeval import COCOeval
-from torch.utils.data import Dataset
-
-from mmdet import datasets
-from .coco_utils import fast_eval_recall, results2json
-from .mean_ap import eval_map
+from mmcv.runner import DistEvalHook as BaseDistEvalHook
+from mmcv.runner import EvalHook as BaseEvalHook
+from torch.nn.modules.batchnorm import _BatchNorm
 
 
-class DistEvalHook(Hook):
+def _calc_dynamic_intervals(start_interval, dynamic_interval_list):
+    assert mmcv.is_list_of(dynamic_interval_list, tuple)
 
-    def __init__(self, dataset, interval=1):
-        if isinstance(dataset, Dataset):
-            self.dataset = dataset
-        elif isinstance(dataset, dict):
-            self.dataset = datasets.build_dataset(dataset, {'test_mode': True})
-        else:
-            raise TypeError(
-                'dataset must be a Dataset object or a dict, not {}'.format(
-                    type(dataset)))
-        self.interval = interval
+    dynamic_milestones = [0]
+    dynamic_milestones.extend(
+        [dynamic_interval[0] for dynamic_interval in dynamic_interval_list])
+    dynamic_intervals = [start_interval]
+    dynamic_intervals.extend(
+        [dynamic_interval[1] for dynamic_interval in dynamic_interval_list])
+    return dynamic_milestones, dynamic_intervals
 
-    def after_train_epoch(self, runner):
-        if not self.every_n_epochs(runner, self.interval):
+
+class EvalHook(BaseEvalHook):
+
+    def __init__(self, *args, dynamic_intervals=None, **kwargs):
+        super(EvalHook, self).__init__(*args, **kwargs)
+
+        self.use_dynamic_intervals = dynamic_intervals is not None
+        if self.use_dynamic_intervals:
+            self.dynamic_milestones, self.dynamic_intervals = \
+                _calc_dynamic_intervals(self.interval, dynamic_intervals)
+
+    def _decide_interval(self, runner):
+        if self.use_dynamic_intervals:
+            progress = runner.epoch if self.by_epoch else runner.iter
+            step = bisect.bisect(self.dynamic_milestones, (progress + 1))
+            # Dynamically modify the evaluation interval
+            self.interval = self.dynamic_intervals[step - 1]
+
+    def before_train_epoch(self, runner):
+        """Evaluate the model only at the start of training by epoch."""
+        self._decide_interval(runner)
+        super().before_train_epoch(runner)
+
+    def before_train_iter(self, runner):
+        self._decide_interval(runner)
+        super().before_train_iter(runner)
+
+    def _do_evaluate(self, runner):
+        """perform evaluation and save ckpt."""
+        if not self._should_evaluate(runner):
             return
-        runner.model.eval()
-        results = [None for _ in range(len(self.dataset))]
-        if runner.rank == 0:
-            prog_bar = mmcv.ProgressBar(len(self.dataset))
-        for idx in range(runner.rank, len(self.dataset), runner.world_size):
-            data = self.dataset[idx]
-            data_gpu = scatter(
-                collate([data], samples_per_gpu=1),
-                [torch.cuda.current_device()])[0]
 
-            # compute output
-            with torch.no_grad():
-                result = runner.model(
-                    return_loss=False, rescale=True, **data_gpu)
-            results[idx] = result
+        from mmdet.apis import single_gpu_test
+        results = single_gpu_test(runner.model, self.dataloader, show=False)
+        runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
+        key_score = self.evaluate(runner, results)
+        if self.save_best:
+            self._save_ckpt(runner, key_score)
 
-            batch_size = runner.world_size
-            if runner.rank == 0:
-                for _ in range(batch_size):
-                    prog_bar.update()
 
+# Note: Considering that MMCV's EvalHook updated its interface in V1.3.16,
+# in order to avoid strong version dependency, we did not directly
+# inherit EvalHook but BaseDistEvalHook.
+class DistEvalHook(BaseDistEvalHook):
+
+    def __init__(self, *args, dynamic_intervals=None, **kwargs):
+        super(DistEvalHook, self).__init__(*args, **kwargs)
+
+        self.use_dynamic_intervals = dynamic_intervals is not None
+        if self.use_dynamic_intervals:
+            self.dynamic_milestones, self.dynamic_intervals = \
+                _calc_dynamic_intervals(self.interval, dynamic_intervals)
+
+    def _decide_interval(self, runner):
+        if self.use_dynamic_intervals:
+            progress = runner.epoch if self.by_epoch else runner.iter
+            step = bisect.bisect(self.dynamic_milestones, (progress + 1))
+            # Dynamically modify the evaluation interval
+            self.interval = self.dynamic_intervals[step - 1]
+
+    def before_train_epoch(self, runner):
+        """Evaluate the model only at the start of training by epoch."""
+        self._decide_interval(runner)
+        super().before_train_epoch(runner)
+
+    def before_train_iter(self, runner):
+        self._decide_interval(runner)
+        super().before_train_iter(runner)
+
+    def _do_evaluate(self, runner):
+        """perform evaluation and save ckpt."""
+        # Synchronization of BatchNorm's buffer (running_mean
+        # and running_var) is not supported in the DDP of pytorch,
+        # which may cause the inconsistent performance of models in
+        # different ranks, so we broadcast BatchNorm's buffers
+        # of rank 0 to other ranks to avoid this.
+        if self.broadcast_bn_buffer:
+            model = runner.model
+            for name, module in model.named_modules():
+                if isinstance(module,
+                              _BatchNorm) and module.track_running_stats:
+                    dist.broadcast(module.running_var, 0)
+                    dist.broadcast(module.running_mean, 0)
+
+        if not self._should_evaluate(runner):
+            return
+
+        tmpdir = self.tmpdir
+        if tmpdir is None:
+            tmpdir = osp.join(runner.work_dir, '.eval_hook')
+
+        from mmdet.apis import multi_gpu_test
+        results = multi_gpu_test(
+            runner.model,
+            self.dataloader,
+            tmpdir=tmpdir,
+            gpu_collect=self.gpu_collect)
         if runner.rank == 0:
             print('\n')
-            dist.barrier()
-            for i in range(1, runner.world_size):
-                tmp_file = osp.join(runner.work_dir, 'temp_{}.pkl'.format(i))
-                tmp_results = mmcv.load(tmp_file)
-                for idx in range(i, len(results), runner.world_size):
-                    results[idx] = tmp_results[idx]
-                os.remove(tmp_file)
-            self.evaluate(runner, results)
-        else:
-            tmp_file = osp.join(runner.work_dir,
-                                'temp_{}.pkl'.format(runner.rank))
-            mmcv.dump(results, tmp_file)
-            dist.barrier()
-        dist.barrier()
+            runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
+            key_score = self.evaluate(runner, results)
 
-    def evaluate(self):
-        raise NotImplementedError
-
-
-class DistEvalmAPHook(DistEvalHook):
-
-    def evaluate(self, runner, results):
-        gt_bboxes = []
-        gt_labels = []
-        gt_ignore = []
-        for i in range(len(self.dataset)):
-            ann = self.dataset.get_ann_info(i)
-            bboxes = ann['bboxes']
-            labels = ann['labels']
-            if 'bboxes_ignore' in ann:
-                ignore = np.concatenate([
-                    np.zeros(bboxes.shape[0], dtype=np.bool),
-                    np.ones(ann['bboxes_ignore'].shape[0], dtype=np.bool)
-                ])
-                gt_ignore.append(ignore)
-                bboxes = np.vstack([bboxes, ann['bboxes_ignore']])
-                labels = np.concatenate([labels, ann['labels_ignore']])
-            gt_bboxes.append(bboxes)
-            gt_labels.append(labels)
-        if not gt_ignore:
-            gt_ignore = None
-        # If the dataset is VOC2007, then use 11 points mAP evaluation.
-        if hasattr(self.dataset, 'year') and self.dataset.year == 2007:
-            ds_name = 'voc07'
-        else:
-            ds_name = self.dataset.CLASSES
-        mean_ap, eval_results = eval_map(
-            results,
-            gt_bboxes,
-            gt_labels,
-            gt_ignore=gt_ignore,
-            scale_ranges=None,
-            iou_thr=0.5,
-            dataset=ds_name,
-            print_summary=True)
-        runner.log_buffer.output['mAP'] = mean_ap
-        runner.log_buffer.ready = True
-
-
-class CocoDistEvalRecallHook(DistEvalHook):
-
-    def __init__(self,
-                 dataset,
-                 interval=1,
-                 proposal_nums=(100, 300, 1000),
-                 iou_thrs=np.arange(0.5, 0.96, 0.05)):
-        super(CocoDistEvalRecallHook, self).__init__(
-            dataset, interval=interval)
-        self.proposal_nums = np.array(proposal_nums, dtype=np.int32)
-        self.iou_thrs = np.array(iou_thrs, dtype=np.float32)
-
-    def evaluate(self, runner, results):
-        # the official coco evaluation is too slow, here we use our own
-        # implementation instead, which may get slightly different results
-        ar = fast_eval_recall(results, self.dataset.coco, self.proposal_nums,
-                              self.iou_thrs)
-        for i, num in enumerate(self.proposal_nums):
-            runner.log_buffer.output['AR@{}'.format(num)] = ar[i]
-        runner.log_buffer.ready = True
-
-
-class CocoDistEvalmAPHook(DistEvalHook):
-
-    def evaluate(self, runner, results):
-        tmp_file = osp.join(runner.work_dir, 'temp_0')
-        result_files = results2json(self.dataset, results, tmp_file)
-
-        res_types = ['bbox', 'segm'
-                     ] if runner.model.module.with_mask else ['bbox']
-        cocoGt = self.dataset.coco
-        imgIds = cocoGt.getImgIds()
-        for res_type in res_types:
-            try:
-                cocoDt = cocoGt.loadRes(result_files[res_type])
-            except IndexError:
-                print('No prediction found.')
-                break
-            iou_type = res_type
-            cocoEval = COCOeval(cocoGt, cocoDt, iou_type)
-            cocoEval.params.imgIds = imgIds
-            cocoEval.evaluate()
-            cocoEval.accumulate()
-            cocoEval.summarize()
-            metrics = ['mAP', 'mAP_50', 'mAP_75', 'mAP_s', 'mAP_m', 'mAP_l']
-            for i in range(len(metrics)):
-                key = '{}_{}'.format(res_type, metrics[i])
-                val = float('{:.3f}'.format(cocoEval.stats[i]))
-                runner.log_buffer.output[key] = val
-            runner.log_buffer.output['{}_mAP_copypaste'.format(res_type)] = (
-                '{ap[0]:.3f} {ap[1]:.3f} {ap[2]:.3f} {ap[3]:.3f} '
-                '{ap[4]:.3f} {ap[5]:.3f}').format(ap=cocoEval.stats[:6])
-        runner.log_buffer.ready = True
-        for res_type in res_types:
-            os.remove(result_files[res_type])
+            if self.save_best:
+                self._save_ckpt(runner, key_score)

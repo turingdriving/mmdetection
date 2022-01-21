@@ -1,3 +1,4 @@
+# Copyright (c) OpenMMLab. All rights reserved.
 import mmcv
 
 
@@ -94,7 +95,7 @@ dataset_aliases = {
     'imagenet_det': ['det', 'imagenet_det', 'ilsvrc_det'],
     'imagenet_vid': ['vid', 'imagenet_vid', 'ilsvrc_vid'],
     'coco': ['coco', 'mscoco', 'ms_coco'],
-    'wider_face': ['WIDERFaceDataset', 'wider_face', 'WDIERFace'],
+    'wider_face': ['WIDERFaceDataset', 'wider_face', 'WIDERFace'],
     'cityscapes': ['cityscapes']
 }
 
@@ -110,7 +111,7 @@ def get_classes(dataset):
         if dataset in alias2name:
             labels = eval(alias2name[dataset] + '_classes()')
         else:
-            raise ValueError('Unrecognized dataset: {}'.format(dataset))
+            raise ValueError(f'Unrecognized dataset: {dataset}')
     else:
-        raise TypeError('dataset must a str, but got {}'.format(type(dataset)))
+        raise TypeError(f'dataset must a str, but got {type(dataset)}')
     return labels
